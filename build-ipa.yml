@@ -1,0 +1,123 @@
+name: Build Folia Unsigned IPA
+
+# 在 GitHub 的 macOS 云端机器上，把 Folia（chthollyphile/folia-major）的 Web 版
+# 用 Capacitor 套壳，打成一个未签名 IPA。产物在 Actions 运行页的 Artifacts 里下载。
+# 未签名 IPA 需用 AltStore / SideStore / TrollStore 等工具自签后安装。
+
+on:
+  workflow_dispatch:
+    inputs:
+      folia_ref:
+        description: "Folia 源码版本（tag 或分支名）"
+        required: true
+        default: "v0.7.19"
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: 拉取 Folia 源码
+        uses: actions/checkout@v4
+        with:
+          repository: chthollyphile/folia-major
+          ref: ${{ inputs.folia_ref }}
+
+      - name: 安装 Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 选择最新稳定版 Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund --loglevel=error
+
+      - name: 构建 Web 版
+        run: npx vite build
+
+      - name: Capacitor 套壳生成 iOS 工程
+        run: |
+          npm install --no-audit --no-fund --loglevel=error @capacitor/core@8.5.3 @capacitor/cli@8.5.3 @capacitor/ios@8.5.3
+          npx cap init "Folia" "top.izuna.foliamajor" --web-dir=dist
+          npx cap add ios
+          mkdir -p ios/App/App.xcodeproj/xcshareddata/xcschemes
+          cat > ios/App/App.xcodeproj/xcshareddata/xcschemes/App.xcscheme <<'SCHEME_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Scheme LastUpgradeVersion = "0920" version = "1.3">
+             <BuildAction parallelizeBuildables = "YES" buildImplicitDependencies = "YES">
+                <BuildActionEntries>
+                   <BuildActionEntry buildForTesting = "YES" buildForRunning = "YES" buildForProfiling = "YES" buildForArchiving = "YES" buildForAnalyzing = "YES">
+                      <BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "504EC3031FED79650016851F" BuildableName = "App.app" BlueprintName = "App" ReferencedContainer = "container:App.xcodeproj">
+                      </BuildableReference>
+                   </BuildActionEntry>
+                </BuildActionEntries>
+             </BuildAction>
+             <TestAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv = "YES">
+                <Testables>
+                </Testables>
+             </TestAction>
+             <LaunchAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" launchStyle = "0" useCustomWorkingDirectory = "NO" ignoresPersistentStateOnLaunch = "NO" debugDocumentVersioning = "YES" debugServiceExtension = "internal" allowLocationSimulation = "YES">
+                <BuildableProductRunnable runnableDebuggingMode = "0">
+                   <BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "504EC3031FED79650016851F" BuildableName = "App.app" BlueprintName = "App" ReferencedContainer = "container:App.xcodeproj">
+                   </BuildableReference>
+                </BuildableProductRunnable>
+             </LaunchAction>
+             <ProfileAction buildConfiguration = "Release" shouldUseLaunchSchemeArgsEnv = "YES" savedToolIdentifier = "" useCustomWorkingDirectory = "NO" debugDocumentVersioning = "YES">
+                <BuildableProductRunnable runnableDebuggingMode = "0">
+                   <BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "504EC3031FED79650016851F" BuildableName = "App.app" BlueprintName = "App" ReferencedContainer = "container:App.xcodeproj">
+                   </BuildableReference>
+                </BuildableProductRunnable>
+             </ProfileAction>
+             <AnalyzeAction buildConfiguration = "Debug">
+             </AnalyzeAction>
+             <ArchiveAction buildConfiguration = "Release" revealArchiveInOrganizer = "YES">
+             </ArchiveAction>
+          </Scheme>
+          SCHEME_EOF
+          npx cap sync ios
+
+      - name: 放行流媒体服务器连接（HTTP 明文 / 局域网 / 原生请求通道）
+        run: |
+          # 1) 让 Folia 的 fetch/XHR 走原生网络层（CapacitorHttp），绕开 WebView 跨域限制；同时允许明文 HTTP
+          CFG=ios/App/App/capacitor.config.json
+          jq '.server.cleartext = true | .plugins.CapacitorHttp.enabled = true' "$CFG" > cfg.tmp && mv cfg.tmp "$CFG"
+          cat "$CFG"
+          # 2) Info.plist：放开 ATS，并补局域网访问说明（连家里 Navidrome 等流媒体服务器必需）
+          PLIST=ios/App/App/Info.plist
+          PB=/usr/libexec/PlistBuddy
+          $PB -c "Delete :NSAppTransportSecurity" "$PLIST" 2>/dev/null || true
+          $PB -c "Add :NSAppTransportSecurity dict" "$PLIST"
+          $PB -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST"
+          $PB -c "Delete :NSLocalNetworkUsageDescription" "$PLIST" 2>/dev/null || true
+          $PB -c "Add :NSLocalNetworkUsageDescription string 用于连接局域网内的流媒体服务器（如 Navidrome）" "$PLIST"
+          $PB -c "Print" "$PLIST" | grep -A2 -i "AppTransportSecurity\|LocalNetwork" || true
+
+      - name: 编译未签名 App
+        run: |
+          xcodebuild \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            clean build
+
+      - name: 打包 IPA
+        run: |
+          APP_PATH=$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "App bundle: $APP_PATH"
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -qry Folia-unsigned.ipa Payload
+          ls -lh Folia-unsigned.ipa
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Folia-unsigned-ipa
+          path: Folia-unsigned.ipa
+          if-no-files-found: error
